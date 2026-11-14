@@ -1,0 +1,4 @@
+-r requirements.txt
+# Static analysis used locally and in the CI "quality" job.
+ruff==0.17.4
+mypy==2.3.1

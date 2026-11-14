@@ -1,0 +1,83 @@
+[project]
+name = "eventhub-qa-automation"
+version = "1.0.0"
+description = "UI + API test automation for the EventHub ticket-booking flow (US-114)"
+readme = "README.md"
+requires-python = ">=3.10"
+
+# Exact pins live in requirements.txt / requirements-dev.txt so local runs and CI are reproducible.
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--browser=chromium",
+    "--tracing=retain-on-failure",
+    "--screenshot=only-on-failure",
+    "--output=test-results",
+    "--junitxml=reports/junit.xml",
+    "--html=reports/report.html",
+    "--self-contained-html",
+]
+markers = [
+    # Test type: applied automatically from the folder the test lives in (see fixtures/reporting.py).
+    "contract: response conforms to the OpenAPI spec (tests/contract)",
+    "api: business rules through the REST API (tests/api)",
+    "ui: single-page behaviour in the browser (tests/ui)",
+    "e2e: full user journey across UI and API (tests/e2e)",
+    "performance: response-time budgets; opt-in, run with -m performance (tests/performance)",
+    # Cross-cutting tags, set explicitly on tests.
+    "smoke: critical-path check, fast enough to run on every push",
+    "negative: invalid input / error-path behaviour",
+    "security: authentication & authorization (tenant isolation) checks",
+    "acceptance(*criteria): links a test to US-114 acceptance criteria, e.g. acceptance('AC1', 'AC2')",
+    "ac1: auto-applied from acceptance('AC1')",
+    "ac2: auto-applied from acceptance('AC2')",
+    "ac3: auto-applied from acceptance('AC3')",
+    "ac4: auto-applied from acceptance('AC4')",
+    "ac5: auto-applied from acceptance('AC5')",
+    "as_user(role): run the test as this identity ('primary' | 'secondary'); default is 'primary'",
+    "anonymous: run the test with no authentication at all",
+]
+log_level = "INFO"
+log_format = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+log_date_format = "%H:%M:%S"
+# xunit1 permits per-test <properties>, which carry the story / acceptance criteria / latency figures.
+junit_family = "xunit1"
+filterwarnings = [
+    "error::pytest.PytestUnknownMarkWarning",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["test-results", "reports"]
+
+[tool.ruff.format]
+exclude = ["*.md"]  # keep hand-aligned examples in the README
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "PT", "RUF", "N"]
+ignore = [
+    "RUF001", # we intentionally match the UI's unicode minus sign and multiplication sign
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["framework", "fixtures", "tests"]
+
+[tool.mypy]
+python_version = "3.10"
+plugins = ["pydantic.mypy"]
+strict_optional = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+disallow_untyped_defs = true
+exclude = ["tests/"]
+
+[[tool.mypy.overrides]]
+module = ["openapi_schema_validator", "openapi_schema_validator.*"]
+ignore_missing_imports = true

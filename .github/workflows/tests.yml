@@ -1,0 +1,209 @@
+name: EventHub tests
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 2 * * *" # nightly: functional regression + performance budgets (02:17 UTC)
+  workflow_dispatch:
+    inputs:
+      marker:
+        description: 'Optional pytest -m expression for the functional suite, e.g. "smoke" or "contract" (empty = all)'
+        required: false
+        default: ""
+      performance:
+        description: "Also run the (non-blocking) performance suite"
+        type: boolean
+        default: false
+      data_seed:
+        description: "Optional data seed to replay a failed run's generated data (see its log header: eventhub data seed). Empty = this run's id"
+        required: false
+        default: ""
+
+# Every run uses the same two EventHub accounts, i.e. the same capped sandboxes (9 bookings / 6 events,
+# oldest silently replaced). Runs are therefore queued rather than allowed to race each other.
+concurrency:
+  group: eventhub-sandbox
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  # Stamped on every event the suite creates, so leftover data can be traced to this pipeline run.
+  EVENTHUB_RUN_ID: gha-${{ github.run_id }}-${{ github.run_attempt }}
+  # One data seed per pipeline (shared by every pytest step and kept on "Re-run jobs"), or the seed of a
+  # failed run to replay its data. Printed in each log header and on the run summary page.
+  EVENTHUB_DATA_SEED: ${{ github.event.inputs.data_seed || github.run_id }}
+
+jobs:
+  static-checks:
+    name: Lint, type-check, collect
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Ruff (lint + format)
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Mypy (framework, fixtures, root conftest)
+        run: mypy framework fixtures conftest.py
+
+      - name: Import every framework module on its own (circular imports that collection order can hide)
+        run: |
+          for module in $(find framework -name '*.py' | sed 's/\.py$//; s/\/__init__$//; s/\//./g' | sort -u); do
+            python -c "import $module" || { echo "::error::framework module $module cannot be imported on its own"; exit 1; }
+          done
+
+      - name: Collect tests (import, marker, folder-structure and fixture wiring errors)
+        run: pytest --collect-only -q -m "performance or not performance"
+
+  functional:
+    name: Contract, API, UI and E2E tests
+    needs: static-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      EVENTHUB_PRIMARY_EMAIL: ${{ secrets.EVENTHUB_PRIMARY_EMAIL }}
+      EVENTHUB_PRIMARY_PASSWORD: ${{ secrets.EVENTHUB_PRIMARY_PASSWORD }}
+      EVENTHUB_SECONDARY_EMAIL: ${{ secrets.EVENTHUB_SECONDARY_EMAIL }}
+      EVENTHUB_SECONDARY_PASSWORD: ${{ secrets.EVENTHUB_SECONDARY_PASSWORD }}
+      MARKER: ${{ github.event.inputs.marker }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check test-account secrets
+        shell: bash
+        run: |
+          missing=0
+          for name in EVENTHUB_PRIMARY_EMAIL EVENTHUB_PRIMARY_PASSWORD EVENTHUB_SECONDARY_EMAIL EVENTHUB_SECONDARY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Repository secret ${name} is not set (Settings > Secrets and variables > Actions)."
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Contract + API tests (no browser)
+        id: api
+        shell: bash
+        run: |
+          expr="contract or api"
+          if [ -n "${MARKER}" ]; then expr="(${expr}) and (${MARKER})"; fi
+          pytest -n 3 -m "${expr}" --junitxml=reports/api-junit.xml --html=reports/api-report.html \
+            2>&1 | tee reports-api.log
+
+      - name: UI + end-to-end tests (Chromium)
+        if: success() || steps.api.outcome == 'failure'
+        shell: bash
+        run: |
+          expr="ui or e2e"
+          if [ -n "${MARKER}" ]; then expr="(${expr}) and (${MARKER})"; fi
+          pytest -n 3 -m "${expr}" --junitxml=reports/ui-junit.xml --html=reports/ui-report.html \
+            2>&1 | tee reports-ui.log
+
+      - name: Publish traceability matrices to the run summary
+        if: always()
+        shell: bash
+        run: |
+          for layer in api ui; do
+            [ -f "reports-${layer}.log" ] || continue
+            {
+              echo "### ${layer^^} run: US-114 acceptance-criteria traceability"
+              echo '```'
+              grep -m2 -E '^eventhub (run id|data seed):' "reports-${layer}.log" || true
+              sed -n '/acceptance-criteria traceability/,/XFail = known defect/p' "reports-${layer}.log" || true
+              tail -n 1 "reports-${layer}.log" || true
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+          done
+
+      - name: Upload reports and Playwright traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eventhub-functional-report-${{ github.run_number }}
+          path: |
+            reports/
+            reports-*.log
+            test-results/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  performance:
+    name: Performance budgets (non-blocking)
+    needs: functional
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.performance)
+    continue-on-error: true # report-only: latency on a shared public environment must not block delivery
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      EVENTHUB_PRIMARY_EMAIL: ${{ secrets.EVENTHUB_PRIMARY_EMAIL }}
+      EVENTHUB_PRIMARY_PASSWORD: ${{ secrets.EVENTHUB_PRIMARY_PASSWORD }}
+      EVENTHUB_SECONDARY_EMAIL: ${{ secrets.EVENTHUB_SECONDARY_EMAIL }}
+      EVENTHUB_SECONDARY_PASSWORD: ${{ secrets.EVENTHUB_SECONDARY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies (API only - no browser needed)
+        run: pip install -r requirements.txt
+
+      - name: Measure API latency (sequential, single worker)
+        shell: bash
+        run: |
+          pytest -m performance --junitxml=reports/perf-junit.xml --html=reports/perf-report.html \
+            2>&1 | tee reports-perf.log
+
+      - name: Publish latency table to the run summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '### API latency (p95 budgets)'
+            echo '```'
+            grep -m2 -E '^eventhub (run id|data seed):' reports-perf.log || true
+            sed -n '/API latency (ms)/,/^=/p' reports-perf.log | sed '$d' || true
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eventhub-performance-report-${{ github.run_number }}
+          path: |
+            reports/
+            reports-perf.log
+          if-no-files-found: ignore
+          retention-days: 30

@@ -1,0 +1,11 @@
+# Runtime dependencies for executing the suite (exact pins for reproducible runs).
+playwright==1.63.0
+pytest==9.1.1
+pytest-playwright==0.7.2
+pytest-xdist==3.8.0
+pytest-html==4.2.0
+pydantic==2.13.5
+pydantic-settings==2.16.2
+python-dotenv==1.2.3
+Faker==40.54.0
+openapi-schema-validator==0.9.0
